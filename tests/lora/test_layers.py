@@ -4,6 +4,7 @@
 import random
 from copy import deepcopy
 from dataclasses import dataclass
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -15,6 +16,7 @@ from vllm.lora.layers import (
     BaseLayerWithLoRA,
     ColumnParallelLinearWithLoRA,
     ColumnParallelLinearWithShardedLoRA,
+    FusedMoE3DWithLoRA,
     LogitsProcessorWithLoRA,
     LoRAMapping,
     MergedColumnParallelLinearVariableSliceWithLoRA,
@@ -77,6 +79,27 @@ DEVICES = (
 
 # prefill stage(True) or decode stage(False)
 STAGES = [True, False]
+
+
+@pytest.mark.parametrize(
+    "architecture", ["GptOssForCausalLM", "GptOssPuzzleForCausalLM"]
+)
+def test_gpt_oss_3d_moe_lora_tp_slice_is_interleaved(architecture: str) -> None:
+    layer = object.__new__(FusedMoE3DWithLoRA)
+    object.__setattr__(layer, "tp_size", 2)
+    object.__setattr__(layer, "tp_rank", 0)
+    object.__setattr__(
+        layer,
+        "moe_config",
+        SimpleNamespace(intermediate_size_per_partition=2),
+    )
+    object.__setattr__(layer, "_base_model", architecture)
+    w13_lora_b = torch.arange(8).reshape(1, 8, 1)
+
+    result = FusedMoE3DWithLoRA._slice_w13_b(layer, w13_lora_b)
+
+    torch.testing.assert_close(result.flatten(), torch.tensor([0, 1, 2, 3]))
+
 
 NUM_RANDOM_SEEDS = 2
 

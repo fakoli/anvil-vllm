@@ -4,11 +4,18 @@
 
 import glob
 import tempfile
+from dataclasses import dataclass
+from types import SimpleNamespace
 
 import huggingface_hub.constants
 import pytest
 import torch
 
+from vllm.config import LoadConfig
+from vllm.model_executor.model_loader.default_loader import (
+    DefaultModelLoader,
+    _get_per_layer_expert_counts,
+)
 from vllm.model_executor.model_loader.ep_weight_filter import (
     compute_local_expert_ids,
     parse_expert_id,
@@ -155,6 +162,90 @@ class TestComputeLocalExpertIds:
         assert ids_1 == {1, 4, 7}
         assert ids_2 == {2, 5, 8}
         assert ids_0 | ids_1 | ids_2 == set(range(10))
+
+
+@dataclass
+class _DataclassBlockConfig:
+    num_local_experts: int
+
+
+class TestDefaultLoaderEpFilterInitialization:
+    @staticmethod
+    def _model_config(block_configs):
+        hf_config = SimpleNamespace(block_configs=block_configs)
+        return SimpleNamespace(
+            hf_config=hf_config,
+            hf_text_config=hf_config,
+            is_moe=True,
+            get_num_experts=lambda: 128,
+        )
+
+    @staticmethod
+    def _patch_parallel_groups(monkeypatch: pytest.MonkeyPatch) -> None:
+        parallel_config = SimpleNamespace(
+            enable_expert_parallel=True,
+            enable_ep_weight_filter=True,
+            enable_eplb=False,
+            data_parallel_size=2,
+            tensor_parallel_size=1,
+            prefill_context_parallel_size=1,
+            expert_placement_strategy="linear",
+        )
+        monkeypatch.setattr(
+            "vllm.config.get_current_vllm_config",
+            lambda: SimpleNamespace(parallel_config=parallel_config),
+        )
+        monkeypatch.setattr(
+            "vllm.distributed.get_dp_group",
+            lambda: SimpleNamespace(rank_in_group=1),
+        )
+        monkeypatch.setattr(
+            "vllm.distributed.get_pcp_group",
+            lambda: SimpleNamespace(rank_in_group=0),
+        )
+        monkeypatch.setattr(
+            "vllm.distributed.get_tensor_model_parallel_rank", lambda: 0
+        )
+
+    def test_detects_mapping_dataclass_and_attribute_block_configs(self):
+        model_config = self._model_config(
+            [
+                {"num_local_experts": 128},
+                _DataclassBlockConfig(num_local_experts=64),
+                SimpleNamespace(num_experts=96),
+                {"block_type": "attention", "num_experts": 256},
+            ]
+        )
+
+        assert _get_per_layer_expert_counts(model_config) == {64, 96, 128}
+
+    def test_heterogeneous_counts_disable_global_filter(self, monkeypatch):
+        self._patch_parallel_groups(monkeypatch)
+        model_config = self._model_config(
+            [
+                {"num_local_experts": 128},
+                _DataclassBlockConfig(num_local_experts=64),
+            ]
+        )
+        loader = DefaultModelLoader(LoadConfig())
+
+        loader._init_ep_weight_filter(model_config)
+
+        assert loader.local_expert_ids is None
+
+    def test_homogeneous_counts_keep_global_filter(self, monkeypatch):
+        self._patch_parallel_groups(monkeypatch)
+        model_config = self._model_config(
+            [
+                {"num_local_experts": 128},
+                _DataclassBlockConfig(num_local_experts=128),
+            ]
+        )
+        loader = DefaultModelLoader(LoadConfig())
+
+        loader._init_ep_weight_filter(model_config)
+
+        assert loader.local_expert_ids == set(range(64, 128))
 
 
 # ---------------------------------------------------------------------------

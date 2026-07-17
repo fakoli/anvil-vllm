@@ -22,6 +22,7 @@ from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.openai.parser.harmony_utils import (
     build_harmony_preamble,
     extract_instructions_from_messages,
+    is_harmony_model,
     parse_chat_inputs_to_harmony_messages,
     render_for_completion,
 )
@@ -70,7 +71,7 @@ class OnlineRenderer:
 
         self.enable_auto_tools = enable_auto_tools
         self.exclude_tools_when_tool_choice_none = exclude_tools_when_tool_choice_none
-        self.use_harmony = model_config.hf_config.model_type == "gpt_oss"
+        self.use_harmony = is_harmony_model(model_config.hf_config.model_type)
         self.parser: type[Parser] | None = ParserManager.get_parser(
             tool_parser_name=tool_parser,
             reasoning_parser_name=reasoning_parser,

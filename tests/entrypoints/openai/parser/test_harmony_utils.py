@@ -14,6 +14,7 @@ from vllm.entrypoints.openai.parser.harmony_utils import (
     get_system_message,
     has_custom_tools,
     is_function_recipient,
+    is_harmony_model,
     parse_chat_input_to_harmony_message,
 )
 from vllm.entrypoints.openai.responses.harmony import (
@@ -27,6 +28,19 @@ _TOOL_PARAMETERS = {
     "required": ["status"],
     "additionalProperties": False,
 }
+
+
+@pytest.mark.parametrize(
+    ("model_type", "expected"),
+    [
+        ("gpt_oss", True),
+        ("gpt_oss_puzzle", True),
+        ("llama", False),
+        (None, False),
+    ],
+)
+def test_is_harmony_model(model_type, expected):
+    assert is_harmony_model(model_type) is expected
 
 
 class TestCreateToolDefinition:

@@ -9,6 +9,7 @@ from vllm import envs
 from vllm.config.lora import LoRAConfig
 from vllm.distributed.utils import divide
 from vllm.lora.layers.base import BaseLayerWithLoRA
+from vllm.lora.model_family import is_gpt_oss_model_architecture
 from vllm.model_executor.custom_op import maybe_get_oot_by_class
 from vllm.model_executor.layers.fused_moe import MoERunner
 from vllm.model_executor.layers.fused_moe.experts.lora_context import MoELoRAContext
@@ -562,7 +563,7 @@ class FusedMoE3DWithLoRA(FusedMoEWithLoRA):
         start_idx = self.tp_rank * shard_size
         end_idx = (self.tp_rank + 1) * shard_size
         # HACK: Currently, only GPT-OSS is in interleaved order
-        if self._base_model == "GptOssForCausalLM":
+        if is_gpt_oss_model_architecture(self._base_model):
             # For models like GPT-OSS, the weights of w1 (gate_proj) and w3 (up_proj)
             # in the interleaved order, and corresponding LoRA need to be processed.
             w1_lora_b = w13_lora_b[:, ::2, :]

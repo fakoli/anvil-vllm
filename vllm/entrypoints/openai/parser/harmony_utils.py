@@ -28,6 +28,13 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+_HARMONY_MODEL_TYPES = frozenset({"gpt_oss", "gpt_oss_puzzle"})
+
+
+def is_harmony_model(model_type: str | None) -> bool:
+    """Return whether a model type uses the Harmony wire format."""
+    return model_type in _HARMONY_MODEL_TYPES
+
 
 def is_function_recipient(
     recipient: str,
