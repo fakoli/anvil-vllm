@@ -300,7 +300,9 @@ class ModelConfig:
     """Overrides or sets generation config. e.g. `{"temperature": 0.5}`. If
     used with `--generation-config auto`, the override parameters will be
     merged with the default config from the model. If used with
-    `--generation-config vllm`, only the override parameters are used."""
+    `--generation-config vllm`, only the override parameters are used. The
+    override applies to the full generation config, including special tokens
+    such as `eos_token_id` and `stop_token_ids`."""
     enable_sleep_mode: bool = False
     """Enable sleep mode for the engine (only cuda and
     hip platforms are supported)."""
@@ -1492,10 +1494,10 @@ class ModelConfig:
                 hf_token=self.hf_token,
             )
 
-        if config is None:
-            return {}
+        config_dict = {} if config is None else config.to_diff_dict()
+        config_dict.update(self.override_generation_config)
 
-        return config.to_diff_dict()
+        return config_dict
 
     def get_diff_sampling_param(self) -> dict[str, Any]:
         """
@@ -1514,10 +1516,11 @@ class ModelConfig:
         """
         src = self.generation_config
 
-        config = {} if src == "vllm" else self.try_get_generation_config()
-
-        # Overriding with given generation config
-        config.update(self.override_generation_config)
+        config = (
+            dict(self.override_generation_config)
+            if src == "vllm"
+            else self.try_get_generation_config()
+        )
 
         available_params = [
             "repetition_penalty",

@@ -769,6 +769,21 @@ def test_generation_config_loading():
     assert model_config.get_diff_sampling_param() == override_generation_config
 
 
+def test_override_generation_config_special_tokens():
+    model_config = ModelConfig(
+        "Qwen/Qwen2.5-1.5B-Instruct",
+        generation_config="auto",
+        override_generation_config={
+            "eos_token_id": [106],
+            "stop_token_ids": [107],
+        },
+    )
+
+    generation_config = model_config.try_get_generation_config()
+    assert generation_config["eos_token_id"] == [106]
+    assert generation_config["stop_token_ids"] == [107]
+
+
 @pytest.mark.parametrize(
     "pt_load_map_location",
     [
