@@ -22,6 +22,18 @@ from .registry import HF_EXAMPLE_MODELS
 TokensText = tuple[list[int], str]
 
 
+def _shrink_gpt_oss_puzzle_config_for_testing(
+    text_config: PretrainedConfig, num_experts: int
+) -> None:
+    block_configs = getattr(text_config, "block_configs", None)
+    if not block_configs:
+        return
+    block_config = block_configs[0]
+    block_config.num_local_experts = num_experts
+    text_config.block_configs = [block_config]
+    text_config.layer_types = text_config.layer_types[:1]
+
+
 def check_outputs_equal(
     *,
     outputs_0_lst: Sequence[TokensText],
@@ -472,6 +484,9 @@ def dummy_hf_overrides(
     if n_group is None:
         n_group = getattr(text_config, "router_n_groups", None)
     num_experts = n_group * 2 if n_group is not None else 2
+
+    if model_arch == "GptOssPuzzleForCausalLM" and not use_original_num_layers:
+        _shrink_gpt_oss_puzzle_config_for_testing(text_config, num_experts)
 
     # we use three layers for Gemma-3n to check
     # both normal layer and kv_shared_layer

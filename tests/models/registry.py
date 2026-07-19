@@ -309,6 +309,9 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
         "EleutherAI/pythia-70m", {"1b": "EleutherAI/pythia-1.4b"}
     ),
     "GptOssForCausalLM": _HfExamplesInfo("lmsys/gpt-oss-20b-bf16"),
+    "GptOssPuzzleForCausalLM": _HfExamplesInfo(
+        "nvidia/gpt-oss-puzzle-88B", trust_remote_code=True
+    ),
     "GraniteForCausalLM": _HfExamplesInfo("ibm/PowerLM-3b"),
     "GraniteMoeForCausalLM": _HfExamplesInfo("ibm/PowerMoE-3b"),
     "GraniteMoeHybridForCausalLM": _HfExamplesInfo(

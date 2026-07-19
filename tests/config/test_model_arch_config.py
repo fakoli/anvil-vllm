@@ -3,12 +3,15 @@
 """Tests for ModelArchitectureConfig and its integration with ModelConfig."""
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from transformers import PretrainedConfig
 
 from vllm.config import ModelConfig, ParallelConfig, SpeculativeConfig
+from vllm.model_executor.models.config import MODELS_CONFIG_MAP
 from vllm.transformers_utils.model_arch_config_convertor import (
     ModelArchConfigConvertorBase,
 )
@@ -129,6 +132,43 @@ def test_head_size_falls_back_when_head_dim_is_zero():
     convertor = ModelArchConfigConvertorBase(hf_config, hf_config)
 
     assert convertor.get_head_size() == 128
+
+
+def test_num_experts_supports_heterogeneous_block_config_forms():
+    """The architecture snapshot uses the largest per-layer expert count."""
+
+    @dataclass
+    class PuzzleBlockConfig:
+        num_local_experts: int
+
+    hf_config = PretrainedConfig(
+        block_configs=[
+            {"block_type": "moe", "n_routed_experts": 64},
+            PuzzleBlockConfig(num_local_experts=128),
+            SimpleNamespace(num_experts=96),
+            {"block_type": "attention", "num_experts": 256},
+        ]
+    )
+
+    convertor = ModelArchConfigConvertorBase(hf_config, hf_config)
+
+    assert convertor.get_num_experts() == 128
+
+
+def test_gpt_oss_puzzle_uses_gpt_oss_config_normalization():
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(quantization_config={"quant_method": "mxfp4"}),
+        hf_text_config=SimpleNamespace(quantization_config={"quant_method": "mxfp4"}),
+    )
+
+    config_cls = MODELS_CONFIG_MAP["GptOssPuzzleForCausalLM"]
+    config_cls.verify_and_update_model_config(model_config)
+
+    assert model_config.hf_config.quantization_config["quant_method"] == "gpt_oss_mxfp4"
+    assert (
+        model_config.hf_text_config.quantization_config["quant_method"]
+        == "gpt_oss_mxfp4"
+    )
 
 
 @pytest.mark.parametrize("model", BASE_MODELS_TO_TEST)

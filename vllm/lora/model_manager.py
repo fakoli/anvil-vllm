@@ -20,6 +20,7 @@ from vllm.lora.layers import (
 )
 from vllm.lora.lora_model import LoRAModel, MoEEPLoadSpec
 from vllm.lora.lora_weights import LoRALayerWeights, PackedLoRALayerWeights
+from vllm.lora.model_family import is_gpt_oss_model_architecture
 from vllm.lora.punica_wrapper import PunicaWrapperBase, get_punica_wrapper
 from vllm.lora.utils import (
     from_layer,
@@ -144,12 +145,22 @@ class LoRAModelManager:
         self._use_ep = bool(
             vllm_config and vllm_config.parallel_config.enable_expert_parallel
         )
+        self._validate_expert_parallel_support()
         self._init_punica_wrapper(max_num_batched_tokens, vllm_config)
         self._create_lora_modules()
 
         self.moe_ep_load_spec: MoEEPLoadSpec | None = self._build_moe_ep_load_spec()
 
         self.model.lora_manager = self
+
+    def _validate_expert_parallel_support(self) -> None:
+        architectures = getattr(self.model.config, "architectures", None) or ()
+        if self._use_ep and self._is_moe and "GptOssPuzzleForCausalLM" in architectures:
+            raise ValueError(
+                "GPT-OSS Puzzle LoRA does not support expert parallelism because "
+                "its per-layer expert placement is heterogeneous. Disable either "
+                "LoRA or expert parallelism."
+            )
 
     def _init_punica_wrapper(
         self, max_num_batched_tokens: int, vllm_config: VllmConfig
@@ -1010,7 +1021,7 @@ class LoRAModelManager:
             )
         intermediate = intermediate_x2 // 2
         base_arch = self.model.config.architectures[0]
-        if base_arch == "GptOssForCausalLM":
+        if is_gpt_oss_model_architecture(base_arch):
             w1_b = gate_up_b[:, ::2, :].contiguous()
             w3_b = gate_up_b[:, 1::2, :].contiguous()
         else:

@@ -6,10 +6,12 @@ Run `pytest tests/quantization/test_configs.py --forked`.
 """
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
 from vllm.config import ModelConfig
+from vllm.model_executor.layers.quantization.mxfp4 import GptOssMxfp4Config
 from vllm.platforms import current_platform
 
 
@@ -75,3 +77,24 @@ def test_auto_gptq(model_arg_exptype: tuple[str, None, str]) -> None:
         f"but found {found_quantization_type} "
         f"for no --quantization {quantization_arg} case"
     )
+
+
+@pytest.mark.parametrize("model_type", ["gpt_oss", "gpt_oss_puzzle"])
+def test_gpt_oss_mxfp4_override_accepts_model_family(model_type: str) -> None:
+    quantization = GptOssMxfp4Config.override_quantization_method(
+        {"quant_method": "mxfp4"},
+        user_quant=None,
+        hf_config=SimpleNamespace(model_type=model_type),
+    )
+
+    assert quantization == "gpt_oss_mxfp4"
+
+
+def test_gpt_oss_mxfp4_override_rejects_other_models() -> None:
+    quantization = GptOssMxfp4Config.override_quantization_method(
+        {"quant_method": "mxfp4"},
+        user_quant=None,
+        hf_config=SimpleNamespace(model_type="mixtral"),
+    )
+
+    assert quantization is None

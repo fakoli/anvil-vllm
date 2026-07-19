@@ -4,7 +4,7 @@ import dataclasses
 import glob
 import os
 import time
-from collections.abc import Generator, Iterable
+from collections.abc import Generator, Iterable, Mapping
 from typing import cast
 
 import torch
@@ -38,6 +38,37 @@ from vllm.tracing import instrument
 from vllm.transformers_utils.repo_utils import list_filtered_repo_files
 
 logger = init_logger(__name__)
+
+
+def _get_block_config_value(block: object, name: str) -> object | None:
+    if isinstance(block, Mapping):
+        return block.get(name)
+    return getattr(block, name, None)
+
+
+def _get_per_layer_expert_counts(model_config: ModelConfig) -> set[int]:
+    expert_counts: set[int] = set()
+    seen_configs: set[int] = set()
+
+    for hf_config in (
+        getattr(model_config, "hf_config", None),
+        getattr(model_config, "hf_text_config", None),
+    ):
+        if hf_config is None or id(hf_config) in seen_configs:
+            continue
+        seen_configs.add(id(hf_config))
+
+        for block in getattr(hf_config, "block_configs", None) or ():
+            block_type = _get_block_config_value(block, "block_type")
+            if block_type not in (None, "moe"):
+                continue
+            for name in ("n_routed_experts", "num_local_experts", "num_experts"):
+                num_experts = _get_block_config_value(block, name)
+                if isinstance(num_experts, int) and num_experts > 0:
+                    expert_counts.add(num_experts)
+                    break
+
+    return expert_counts
 
 
 class DefaultModelLoader(BaseModelLoader):
@@ -355,6 +386,8 @@ class DefaultModelLoader(BaseModelLoader):
         expert weights.  By computing the set upfront we can skip non-local
         expert tensors *before* reading them from disk.
         """
+        self.local_expert_ids = None
+
         from vllm.config import get_current_vllm_config
 
         vllm_config = get_current_vllm_config()
@@ -372,6 +405,14 @@ class DefaultModelLoader(BaseModelLoader):
         # The weight loader needs to see ALL logical expert weights so it can
         # populate these redundant slots.  Skip the filter entirely.
         if parallel_config.enable_eplb:
+            return
+
+        per_layer_expert_counts = _get_per_layer_expert_counts(model_config)
+        if len(per_layer_expert_counts) > 1:
+            logger.info_once(
+                "EP weight filter disabled because expert counts vary by layer: %s",
+                tuple(sorted(per_layer_expert_counts)),
+            )
             return
 
         num_experts = model_config.get_num_experts()

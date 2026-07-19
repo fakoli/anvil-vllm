@@ -1404,6 +1404,46 @@ async def _render_chat_prompt_token_ids(
     return prompt_token_ids
 
 
+@pytest.mark.asyncio
+async def test_gpt_oss_puzzle_selects_harmony_chat_and_render_paths() -> None:
+    mock_engine = MagicMock(spec=AsyncLLM)
+    mock_engine.errored = False
+    mock_engine.model_config = MockModelConfig()
+    mock_engine.model_config.hf_config = MockHFConfig(model_type="gpt_oss_puzzle")
+    mock_engine.model_config.hf_text_config = MockHFConfig(model_type="gpt_oss_puzzle")
+    mock_engine.input_processor = MagicMock()
+    mock_engine.renderer = _build_renderer(mock_engine.model_config)
+
+    serving_chat = _build_serving_chat(
+        mock_engine,
+        reasoning_parser="openai_gptoss",
+        tool_parser="openai",
+        enable_auto_tools=True,
+    )
+
+    assert serving_chat.parser_cls is HarmonyParser
+    assert serving_chat.online_renderer.use_harmony
+
+    expected: tuple[list[object], list[dict[str, list[int]]]] = (
+        [],
+        [{"prompt_token_ids": [1, 2, 3]}],
+    )
+    serving_chat.online_renderer._make_request_with_harmony = MagicMock(
+        return_value=expected
+    )
+    request = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "Hello"}],
+    )
+
+    result = await serving_chat.online_renderer.render_chat(request)
+
+    assert result == expected
+    serving_chat.online_renderer._make_request_with_harmony.assert_called_once_with(
+        request, False
+    )
+
+
 class TestServingChatWithHarmony:
     """
     These tests ensure Chat Completion requests are being properly converted into

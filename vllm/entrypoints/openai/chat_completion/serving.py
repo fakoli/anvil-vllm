@@ -49,6 +49,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     UsageInfo,
 )
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+from vllm.entrypoints.openai.parser.harmony_utils import is_harmony_model
 from vllm.entrypoints.serve.utils.api_utils import get_max_tokens, should_include_usage
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.entrypoints.serve.utils.tool_calls_utils import (
@@ -149,7 +150,7 @@ class OpenAIServingChat(GenerateBaseServing):
             reasoning_parser_name=reasoning_parser,
             enable_auto_tools=enable_auto_tools,
             model_name=self.model_config.model,
-            is_harmony=self.model_config.hf_config.model_type == "gpt_oss",
+            is_harmony=is_harmony_model(self.model_config.hf_config.model_type),
         )
         if (
             self.parser_cls is not None

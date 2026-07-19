@@ -1546,8 +1546,11 @@ def test_allocate_with_lookahead():
 
 def test_get_kv_cache_config_one_worker():
     # pass max_model_len to pass check_enough_kv_cache_memory
-    model_config = ModelConfig(max_model_len=16)
+    # Keep full-attention memory substantially larger than sliding-window memory
+    # so the grouping assertions exercise weighted padding decisions.
+    model_config = ModelConfig(max_model_len=256)
     vllm_config = VllmConfig(model_config=model_config)
+    vllm_config.scheduler_config.max_num_batched_tokens = 4
 
     mem_per_block_per_layer = 16 * 2 * 64 * 4 * 2
     # all layers are full attention -> single group
@@ -2268,6 +2271,198 @@ def test_request_with_prompt_embeds_and_mm_inputs(hash_fn: Callable[[Any], bytes
         )
     )
     assert block_hashes[1] == expected_hash2
+
+
+class TestFindBestGroupSize:
+    @pytest.fixture
+    def vllm_config(self, monkeypatch):
+        monkeypatch.setenv("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
+        model_config = ModelConfig(max_model_len=229376)
+        scheduler_config = SchedulerConfig(
+            max_num_batched_tokens=2048,
+            max_model_len=model_config.max_model_len,
+            is_encoder_decoder=model_config.is_encoder_decoder,
+        )
+        return VllmConfig(
+            model_config=model_config,
+            scheduler_config=scheduler_config,
+        )
+
+    def test_empty_input_raises(self, vllm_config):
+        with pytest.raises(ValueError, match="must not be empty"):
+            kv_cache_utils._find_best_group_size({}, vllm_config)
+
+    def test_small_groups_still_honor_overhead_threshold(self, vllm_config):
+        first_spec = new_kv_cache_spec()
+        second_spec = new_kv_cache_spec(sliding_window=1)
+        same_type_layers = {
+            first_spec: ["first.0"],
+            second_spec: [f"second.{i}" for i in range(3)],
+        }
+
+        assert kv_cache_utils._find_best_group_size(same_type_layers, vllm_config) == 1
+
+    def test_equal_padding_prefers_larger_group(self, vllm_config):
+        first_spec = new_kv_cache_spec()
+        second_spec = new_kv_cache_spec(sliding_window=1)
+        same_type_layers = {
+            first_spec: [f"first.{i}" for i in range(20)],
+            second_spec: [f"second.{i}" for i in range(30)],
+        }
+
+        assert kv_cache_utils._find_best_group_size(same_type_layers, vllm_config) == 10
+
+    def test_gpt_oss_puzzle_groups(self, vllm_config):
+        specs = {
+            **{f"full.{i}": new_kv_cache_spec() for i in range(10)},
+            **{
+                f"sw128.{i}": new_sliding_window_spec(sliding_window=128)
+                for i in range(18)
+            },
+            **{
+                f"sw8192.{i}": new_sliding_window_spec(sliding_window=8192)
+                for i in range(8)
+            },
+        }
+
+        groups = kv_cache_utils.get_kv_cache_groups(vllm_config, specs)
+
+        assert [len(group.layer_names) for group in groups] == [10, 9, 9, 8]
+        assert max(len(group.layer_names) for group in groups) == 10
+        assert len(groups) == 4
+
+
+def test_gpt_oss_puzzle_auto_fit_converges_after_regrouping(monkeypatch):
+    monkeypatch.setenv("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
+    model_config = ModelConfig(max_model_len=229376)
+    model_config.original_max_model_len = -1
+    scheduler_config = SchedulerConfig(
+        max_num_batched_tokens=2048,
+        max_model_len=model_config.max_model_len,
+        is_encoder_decoder=model_config.is_encoder_decoder,
+    )
+    vllm_config = VllmConfig(
+        model_config=model_config,
+        scheduler_config=scheduler_config,
+    )
+    specs = {
+        **{f"full.{i}": new_kv_cache_spec() for i in range(10)},
+        **{
+            f"sw128.{i}": new_sliding_window_spec(sliding_window=128) for i in range(18)
+        },
+        **{
+            f"sw8192.{i}": new_sliding_window_spec(sliding_window=8192)
+            for i in range(8)
+        },
+    }
+
+    page_size = next(iter(specs.values())).page_size_bytes
+    available_memory = 11690 * page_size
+    [kv_cache_config] = get_kv_cache_configs(
+        vllm_config,
+        [specs],
+        [available_memory],
+    )
+
+    assert vllm_config.model_config.max_model_len == 5264
+    final_groups = kv_cache_utils.get_kv_cache_groups(vllm_config, specs)
+    assert [group.layer_names for group in kv_cache_config.kv_cache_groups] == [
+        group.layer_names for group in final_groups
+    ]
+    assert sorted(len(group.layer_names) for group in final_groups) == [
+        *([2] * 3),
+        *([3] * 10),
+    ]
+
+
+def test_auto_fit_rebuilds_groups_until_stable(monkeypatch):
+    model_config = ModelConfig(max_model_len=100)
+    model_config.original_max_model_len = -1
+    vllm_config = VllmConfig(model_config=model_config)
+    spec = new_kv_cache_spec()
+    first_layout = [KVCacheGroupSpec(["first"], spec)]
+    fitted_layout = [KVCacheGroupSpec(["fitted"], spec)]
+
+    def build_groups(vllm_config, _merged_specs, _worker_specs):
+        layout = (
+            first_layout
+            if vllm_config.model_config.max_model_len == 100
+            else fitted_layout
+        )
+        return layout, [layout]
+
+    def auto_fit(
+        vllm_config,
+        projected_groups,
+        _available_memory,
+        max_model_len_ceiling=None,
+        log_result=True,
+    ):
+        layer_name = projected_groups[0][0].layer_names[0]
+        fitted_len = 40 if layer_name in {"first", "fitted"} else 100
+        vllm_config.model_config.max_model_len = fitted_len
+        return fitted_len
+
+    monkeypatch.setattr(
+        kv_cache_utils, "_build_projected_kv_cache_groups", build_groups
+    )
+    monkeypatch.setattr(kv_cache_utils, "_auto_fit_max_model_len", auto_fit)
+
+    groups, projected_groups, _ = kv_cache_utils._stabilize_auto_fit_kv_cache_groups(
+        vllm_config, {}, [{}], [1]
+    )
+
+    assert groups is fitted_layout
+    assert projected_groups == [fitted_layout]
+    assert vllm_config.model_config.max_model_len == 40
+
+
+def test_auto_fit_group_cycle_uses_lower_memory_layout(monkeypatch):
+    model_config = ModelConfig(max_model_len=100)
+    model_config.original_max_model_len = -1
+    vllm_config = VllmConfig(model_config=model_config)
+    spec = new_kv_cache_spec()
+    high_memory_layout = [KVCacheGroupSpec(["high"], spec)]
+    low_memory_layout = [KVCacheGroupSpec(["low"], spec)]
+
+    def build_groups(vllm_config, _merged_specs, _worker_specs):
+        layout = (
+            high_memory_layout
+            if vllm_config.model_config.max_model_len >= 60
+            else low_memory_layout
+        )
+        return layout, [layout]
+
+    def auto_fit(
+        vllm_config,
+        projected_groups,
+        _available_memory,
+        max_model_len_ceiling=None,
+        log_result=True,
+    ):
+        layer_name = projected_groups[0][0].layer_names[0]
+        fitted_len = 40 if layer_name == "high" else 60
+        vllm_config.model_config.max_model_len = fitted_len
+        return fitted_len
+
+    def memory_usage(_vllm_config, groups):
+        return 100 if groups[0].layer_names == ["high"] else 10
+
+    monkeypatch.setattr(
+        kv_cache_utils, "_build_projected_kv_cache_groups", build_groups
+    )
+    monkeypatch.setattr(kv_cache_utils, "_auto_fit_max_model_len", auto_fit)
+    monkeypatch.setattr(
+        kv_cache_utils, "_max_memory_usage_bytes_from_groups", memory_usage
+    )
+
+    groups, projected_groups, _ = kv_cache_utils._stabilize_auto_fit_kv_cache_groups(
+        vllm_config, {}, [{}], [1]
+    )
+
+    assert groups is low_memory_layout
+    assert projected_groups == [low_memory_layout]
+    assert vllm_config.model_config.max_model_len == 60
 
 
 def test_auto_fit_max_model_len():

@@ -252,7 +252,7 @@ class TransformerBlock(torch.nn.Module):
     def __init__(
         self,
         vllm_config: VllmConfig,
-        quant_config: QuantizationConfig,
+        quant_config: QuantizationConfig | None,
         prefix: str = "",
     ):
         super().__init__()
@@ -361,6 +361,80 @@ class GptOssModel(nn.Module, EagleModelMixin):
             return x, aux_hidden_states
         return x
 
+    def _get_num_experts_for_layer(self, layer_idx: int) -> int:
+        return self.config.num_local_experts
+
+    def _get_max_num_experts(self) -> int:
+        return self.config.num_local_experts
+
+    def _validate_expert_parallel_size(self, ep_size: int) -> None:
+        if not self.parallel_config.enable_expert_parallel:
+            return
+        for layer_idx in range(self.start_layer, self.end_layer):
+            num_experts = self._get_num_experts_for_layer(layer_idx)
+            if ep_size > num_experts:
+                raise ValueError(
+                    f"Expert parallel size {ep_size} exceeds the {num_experts} "
+                    f"experts in layer {layer_idx}."
+                )
+
+    def _get_local_expert_ids(
+        self, layer_idx: int, ep_size: int, ep_rank: int
+    ) -> list[int]:
+        num_experts = self._get_num_experts_for_layer(layer_idx)
+        if ep_size > num_experts:
+            raise ValueError(
+                f"Expert parallel size {ep_size} exceeds the {num_experts} "
+                f"experts in layer {layer_idx}."
+            )
+        if ep_size == 1:
+            return list(range(num_experts))
+
+        expert_map_manager = self.layers[layer_idx].mlp.experts.expert_map_manager
+        if (
+            expert_map_manager.ep_size != ep_size
+            or expert_map_manager.ep_rank != ep_rank
+        ):
+            raise RuntimeError(
+                "The MoE expert map does not match the active expert-parallel "
+                f"group for layer {layer_idx}: expected size/rank "
+                f"{ep_size}/{ep_rank}, got {expert_map_manager.ep_size}/"
+                f"{expert_map_manager.ep_rank}."
+            )
+        local_expert_ids = expert_map_manager.get_local_expert_ids()
+        if not local_expert_ids:
+            raise RuntimeError(
+                f"Expert-parallel rank {ep_rank} has no experts in layer {layer_idx}."
+            )
+        return local_expert_ids
+
+    def _slice_expert_weights(
+        self,
+        weight: torch.Tensor,
+        layer_idx: int,
+        ep_size: int,
+        ep_rank: int,
+    ) -> torch.Tensor:
+        local_expert_ids = self._get_local_expert_ids(layer_idx, ep_size, ep_rank)
+        indices = torch.tensor(local_expert_ids, dtype=torch.long, device=weight.device)
+        return weight.index_select(0, indices)
+
+    def _get_local_expert_id(
+        self,
+        layer_idx: int,
+        expert_id: int,
+        ep_size: int,
+        ep_rank: int,
+    ) -> int | None:
+        local_expert_ids = self._get_local_expert_ids(layer_idx, ep_size, ep_rank)
+        try:
+            return local_expert_ids.index(expert_id)
+        except ValueError:
+            return None
+
+    def _load_qkv_scale(self, name: str, weight: torch.Tensor) -> bool:
+        return False
+
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, weight scales, activation scales
         # (param_name, weight_name, expert_id, shard_id)
@@ -370,14 +444,14 @@ class GptOssModel(nn.Module, EagleModelMixin):
             ckpt_gate_proj_name="w1",
             ckpt_down_proj_name="w2",
             ckpt_up_proj_name="w3",
-            num_experts=self.config.num_local_experts,
+            num_experts=self._get_max_num_experts(),
             num_redundant_experts=0,
         )
 
     def _load_weights_mxfp4(
         self,
-        ep_rank_end: int,
-        ep_rank_start: int,
+        ep_size: int,
+        ep_rank: int,
         heads_per_rank: int,
         head_start: int,
         weights: Iterable[tuple[str, torch.Tensor]],
@@ -387,8 +461,6 @@ class GptOssModel(nn.Module, EagleModelMixin):
         loaded_params: set[str] = set()
 
         use_ep = self.parallel_config.enable_expert_parallel
-        num_experts = self.config.num_local_experts
-
         # In MoE, we need to flatten the tensor parallel size across the data
         # parallel size when EP is disabled.
         tp_size, tp_rank = FusedMoEParallelConfig.flatten_tp_across_dp_and_pcp(
@@ -416,10 +488,21 @@ class GptOssModel(nn.Module, EagleModelMixin):
             if is_pp_missing_parameter(name, self):
                 continue
 
+            if self._load_qkv_scale(name, weight):
+                loaded_params.add(name)
+                continue
+
+            layer_idx = (
+                extract_layer_index(name) if ".routed_experts." in name else None
+            )
+
             if ".w13_weight_scale" in name:
                 # Handle MLP gate and up projection weights scale
                 if use_ep:
-                    narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
+                    assert layer_idx is not None
+                    narrow_weight = self._slice_expert_weights(
+                        weight, layer_idx, ep_size, ep_rank
+                    )
                 else:
                     narrow_weight = weight[:, 2 * tp_rank_start : 2 * tp_rank_end, ...]
 
@@ -437,7 +520,10 @@ class GptOssModel(nn.Module, EagleModelMixin):
             elif ".w2_weight_scale" in name:
                 # Handle MLP down projection weights
                 if use_ep:
-                    narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
+                    assert layer_idx is not None
+                    narrow_weight = self._slice_expert_weights(
+                        weight, layer_idx, ep_size, ep_rank
+                    )
                 else:
                     narrow_weight = weight[
                         ...,
@@ -460,6 +546,8 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 # Handle MLP gate and up projection weights
                 # flat weight from (E, 2 * N, block_size, entry_per_block)
                 # to (E, 2 * N, -1), shouldn't trigger copy for contiguous
+                assert layer_idx is not None
+                num_experts = self._get_num_experts_for_layer(layer_idx)
                 weight = weight.view(
                     num_experts, 2 * intermediate_size, -1
                 ).contiguous()
@@ -467,7 +555,9 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 # Extract gate and up projection parts
                 # since the weight is shuffled, we can slice directly
                 if use_ep:
-                    narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
+                    narrow_weight = self._slice_expert_weights(
+                        weight, layer_idx, ep_size, ep_rank
+                    )
                 else:
                     narrow_weight = weight[:, 2 * tp_rank_start : 2 * tp_rank_end, ...]
 
@@ -486,11 +576,15 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 # Handle MLP down projection weights
                 # same flatten here, but since 2 mx4 value are packed in 1
                 # uint8, divide by 2
+                assert layer_idx is not None
+                num_experts = self._get_num_experts_for_layer(layer_idx)
                 weight = weight.view(
                     num_experts, -1, intermediate_size // 2
                 ).contiguous()
                 if use_ep:
-                    narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
+                    narrow_weight = self._slice_expert_weights(
+                        weight, layer_idx, ep_size, ep_rank
+                    )
                 else:
                     narrow_weight = weight[..., tp_rank_start // 2 : tp_rank_end // 2]
 
@@ -509,7 +603,10 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 # Handle MLP gate and up projection biases
                 # Extract gate and up projection bias parts
                 if use_ep:
-                    narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
+                    assert layer_idx is not None
+                    narrow_weight = self._slice_expert_weights(
+                        weight, layer_idx, ep_size, ep_rank
+                    )
                 else:
                     narrow_weight = weight[:, 2 * tp_rank_start : 2 * tp_rank_end]
 
@@ -529,7 +626,10 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 if use_ep:
-                    weight = weight[ep_rank_start:ep_rank_end, ...]
+                    assert layer_idx is not None
+                    weight = self._slice_expert_weights(
+                        weight, layer_idx, ep_size, ep_rank
+                    )
                 else:
                     # (only load on rank 0 to avoid duplication)
                     if tp_rank != 0:
@@ -569,8 +669,8 @@ class GptOssModel(nn.Module, EagleModelMixin):
 
     def _load_weights_quark(
         self,
-        ep_rank_end: int,
-        ep_rank_start: int,
+        ep_size: int,
+        ep_rank: int,
         heads_per_rank: int,
         head_start: int,
         weights: Iterable[tuple[str, torch.Tensor]],
@@ -580,8 +680,6 @@ class GptOssModel(nn.Module, EagleModelMixin):
         loaded_params: set[str] = set()
 
         use_ep = self.parallel_config.enable_expert_parallel
-        num_experts = self.config.num_local_experts
-
         if use_ep:
             tp_rank = get_tensor_model_parallel_rank()
             tp_size = get_tensor_model_parallel_world_size()
@@ -638,7 +736,12 @@ class GptOssModel(nn.Module, EagleModelMixin):
             if is_pp_missing_parameter(name, self):
                 continue
 
+            if self._load_qkv_scale(name, loaded_weight):
+                loaded_params.add(name)
+                continue
+
             layer_id, expert_id, fused_name = None, None, None
+            local_expert_id = None
             moe_quant_method = None
             if "experts" in name:
                 parts = name.split(".")
@@ -673,13 +776,22 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 )
 
                 moe_quant_method = _get_moe_weight_dtype(layer_id=layer_id)
+                if expert_id is not None:
+                    local_expert_id = expert_id
+                    if use_ep:
+                        local_expert_id = self._get_local_expert_id(
+                            layer_id, expert_id, ep_size, ep_rank
+                        )
+                        if local_expert_id is None:
+                            continue
 
             if (
                 all(key in name for key in ["input_scale", "mlp.experts"])
                 and expert_id is not None
             ):
+                assert local_expert_id is not None
                 assert loaded_weight.numel() == 1
-                expert_data = params_dict[fused_name].data[expert_id]
+                expert_data = params_dict[fused_name].data[local_expert_id]
                 expert_data.copy_(loaded_weight)
                 loaded_params.add(fused_name)
                 continue
@@ -696,6 +808,8 @@ class GptOssModel(nn.Module, EagleModelMixin):
             ):
                 is_w13 = ".w13_" in name
                 is_scale = "_scale" in name
+                assert layer_id is not None
+                num_experts = self._get_num_experts_for_layer(layer_id)
 
                 # Reshape weight for mxfp4 if needed (not for scales)
                 if not is_scale and expert_id is None:
@@ -733,7 +847,13 @@ class GptOssModel(nn.Module, EagleModelMixin):
                         ).contiguous()
 
                 if use_ep:
-                    sliced_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+                    sliced_weight = (
+                        self._slice_expert_weights(
+                            loaded_weight, layer_id, ep_size, ep_rank
+                        )
+                        if expert_id is None
+                        else loaded_weight
+                    )
                 else:
                     if is_w13:
                         if expert_id is None:
@@ -761,7 +881,11 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 # weight loaders without added complexity, so just do the
                 # direct load here.
                 param = params_dict[fused_name]
-                expert_data = param.data[expert_id]
+                expert_data = (
+                    param.data
+                    if expert_id is None
+                    else param.data[typing.cast(int, local_expert_id)]
+                )
                 dim1 = sliced_weight.shape[0]
                 dim2 = sliced_weight.shape[1]
                 expert_data.data[:dim1, :dim2].copy_(sliced_weight)
@@ -770,7 +894,14 @@ class GptOssModel(nn.Module, EagleModelMixin):
 
             elif name.endswith(".w13_weight") and moe_quant_method == "fp8":
                 if use_ep:
-                    narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+                    assert layer_id is not None
+                    narrow_weight = (
+                        self._slice_expert_weights(
+                            loaded_weight, layer_id, ep_size, ep_rank
+                        )
+                        if expert_id is None
+                        else loaded_weight
+                    )
                 else:
                     if expert_id is None:
                         narrow_weight = loaded_weight[
@@ -787,7 +918,8 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 if expert_id is None:
                     param.data.copy_(narrow_weight)
                 else:
-                    param.data[expert_id].copy_(narrow_weight)
+                    assert local_expert_id is not None
+                    param.data[local_expert_id].copy_(narrow_weight)
 
                 loaded_params.add(fused_name)
                 continue
@@ -799,7 +931,14 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 # Check if this is per-channel or per-tensor scale
                 if loaded_weight.numel() > 1 and loaded_weight.dim() == 1:
                     if use_ep:
-                        narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+                        assert layer_id is not None
+                        narrow_weight = (
+                            self._slice_expert_weights(
+                                loaded_weight, layer_id, ep_size, ep_rank
+                            )
+                            if expert_id is None
+                            else loaded_weight
+                        )
                     else:
                         narrow_weight = loaded_weight[
                             2 * tp_rank_start : 2 * tp_rank_end
@@ -810,7 +949,8 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 if expert_id is None:
                     param.data.copy_(narrow_weight)
                 else:
-                    param.data[expert_id].copy_(narrow_weight)
+                    assert local_expert_id is not None
+                    param.data[local_expert_id].copy_(narrow_weight)
 
                 loaded_params.add(fused_name)
                 continue
@@ -822,14 +962,22 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 if expert_id is None:
                     param.data.copy_(loaded_weight)
                 else:
-                    param.data[expert_id].copy_(loaded_weight)
+                    assert local_expert_id is not None
+                    param.data[local_expert_id].copy_(loaded_weight)
 
                 loaded_params.add(fused_name)
                 continue
 
             elif name.endswith(".w2_weight") and moe_quant_method == "fp8":
                 if use_ep:
-                    narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+                    assert layer_id is not None
+                    narrow_weight = (
+                        self._slice_expert_weights(
+                            loaded_weight, layer_id, ep_size, ep_rank
+                        )
+                        if expert_id is None
+                        else loaded_weight
+                    )
                 else:
                     if expert_id is None:
                         narrow_weight = loaded_weight[..., tp_rank_start:tp_rank_end]
@@ -842,7 +990,8 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 if expert_id is None:
                     param.data.copy_(narrow_weight)
                 else:
-                    param.data[expert_id].copy_(narrow_weight)
+                    assert local_expert_id is not None
+                    param.data[local_expert_id].copy_(narrow_weight)
 
                 loaded_params.add(fused_name)
                 continue
@@ -852,14 +1001,22 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 param = params_dict[fused_name]
 
                 if use_ep:
-                    narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+                    assert layer_id is not None
+                    narrow_weight = (
+                        self._slice_expert_weights(
+                            loaded_weight, layer_id, ep_size, ep_rank
+                        )
+                        if expert_id is None
+                        else loaded_weight
+                    )
                 else:
                     narrow_weight = loaded_weight
 
                 if expert_id is None:
                     param.data.copy_(narrow_weight)
                 else:
-                    param.data[expert_id].copy_(narrow_weight)
+                    assert local_expert_id is not None
+                    param.data[local_expert_id].copy_(narrow_weight)
 
                 loaded_params.add(fused_name)
                 continue
@@ -869,7 +1026,14 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 is_w13_bias = name.endswith(".w13_bias")
 
                 if use_ep:
-                    sliced_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+                    assert layer_id is not None
+                    sliced_weight = (
+                        self._slice_expert_weights(
+                            loaded_weight, layer_id, ep_size, ep_rank
+                        )
+                        if expert_id is None
+                        else loaded_weight
+                    )
                 else:
                     if is_w13_bias:
                         if expert_id is None:
@@ -891,7 +1055,11 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 # direct load here.
                 assert fused_name is not None
                 param = params_dict[fused_name]
-                expert_data = param.data[expert_id]
+                expert_data = (
+                    param.data
+                    if expert_id is None
+                    else param.data[typing.cast(int, local_expert_id)]
+                )
                 dim1 = sliced_weight.shape[0]
                 expert_data.data[:dim1].copy_(sliced_weight)
                 loaded_params.add(fused_name)
@@ -981,8 +1149,8 @@ class GptOssModel(nn.Module, EagleModelMixin):
 
     def _load_weights_other(
         self,
-        ep_rank_end: int,
-        ep_rank_start: int,
+        ep_size: int,
+        ep_rank: int,
         heads_per_rank: int,
         head_start: int,
         weights: Iterable[tuple[str, torch.Tensor]],
@@ -1018,11 +1186,22 @@ class GptOssModel(nn.Module, EagleModelMixin):
             if is_pp_missing_parameter(name, self):
                 continue
 
+            if self._load_qkv_scale(name, weight):
+                loaded_params.add(name)
+                continue
+
+            layer_idx = (
+                extract_layer_index(name) if ".routed_experts." in name else None
+            )
+
             if ".w13_weight" in name:
                 # Handle MLP gate and up projection weights
                 # Extract gate and up projection parts
                 if use_ep:
-                    narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
+                    assert layer_idx is not None
+                    narrow_weight = self._slice_expert_weights(
+                        weight, layer_idx, ep_size, ep_rank
+                    )
                 else:
                     narrow_weight = weight[:, :, 2 * tp_rank_start : 2 * tp_rank_end]
 
@@ -1035,7 +1214,10 @@ class GptOssModel(nn.Module, EagleModelMixin):
             elif ".w2_weight" in name:
                 # Handle MLP down projection weights
                 if use_ep:
-                    narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
+                    assert layer_idx is not None
+                    narrow_weight = self._slice_expert_weights(
+                        weight, layer_idx, ep_size, ep_rank
+                    )
                 else:
                     narrow_weight = weight[:, tp_rank_start:tp_rank_end, :]
                 narrow_weight = narrow_weight.permute(0, 2, 1).contiguous()
@@ -1048,7 +1230,10 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 # Handle MLP gate and up projection biases
                 # Extract gate and up projection bias parts
                 if use_ep:
-                    narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
+                    assert layer_idx is not None
+                    narrow_weight = self._slice_expert_weights(
+                        weight, layer_idx, ep_size, ep_rank
+                    )
                 else:
                     narrow_weight = weight[:, 2 * tp_rank_start : 2 * tp_rank_end]
 
@@ -1059,7 +1244,10 @@ class GptOssModel(nn.Module, EagleModelMixin):
             elif ".w2_bias" in name:
                 # Handle MLP down projection bias
                 if use_ep:
-                    weight = weight[ep_rank_start:ep_rank_end, ...]
+                    assert layer_idx is not None
+                    weight = self._slice_expert_weights(
+                        weight, layer_idx, ep_size, ep_rank
+                    )
                 else:
                     # (only load on rank 0 to avoid duplication)
                     if tp_rank != 0:
@@ -1113,10 +1301,7 @@ class GptOssModel(nn.Module, EagleModelMixin):
 
         ep_size = get_ep_group().world_size
         ep_rank = get_ep_group().rank_in_group
-        num_experts = self.config.num_local_experts
-        experts_per_rank = num_experts // ep_size
-        ep_rank_start = ep_rank * experts_per_rank
-        ep_rank_end = (ep_rank + 1) * experts_per_rank
+        self._validate_expert_parallel_size(ep_size)
 
         quant_method = (
             self.config.quantization_config["quant_method"]
@@ -1140,8 +1325,8 @@ class GptOssModel(nn.Module, EagleModelMixin):
 
         if quant_method == "gpt_oss_mxfp4":
             return self._load_weights_mxfp4(
-                ep_rank_end,
-                ep_rank_start,
+                ep_size,
+                ep_rank,
                 heads_per_rank,
                 head_start,
                 weights,
@@ -1149,8 +1334,8 @@ class GptOssModel(nn.Module, EagleModelMixin):
             )
         elif quant_method == "quark":
             return self._load_weights_quark(
-                ep_rank_end,
-                ep_rank_start,
+                ep_size,
+                ep_rank,
                 heads_per_rank,
                 head_start,
                 weights,
@@ -1158,8 +1343,8 @@ class GptOssModel(nn.Module, EagleModelMixin):
             )
         else:
             return self._load_weights_other(
-                ep_rank_end,
-                ep_rank_start,
+                ep_size,
+                ep_rank,
                 heads_per_rank,
                 head_start,
                 weights,
@@ -1170,6 +1355,7 @@ class GptOssModel(nn.Module, EagleModelMixin):
 class GptOssForCausalLM(
     nn.Module, SupportsPP, SupportsEagle, SupportsEagle3, SupportsLoRA
 ):
+    model_cls: type[GptOssModel] = GptOssModel
     is_3d_moe_weight: bool = True
     packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
 
@@ -1211,7 +1397,7 @@ class GptOssForCausalLM(
         self.vllm_config = vllm_config
         self.config = vllm_config.model_config.hf_config
 
-        self.model = GptOssModel(
+        self.model = self.model_cls(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
         )

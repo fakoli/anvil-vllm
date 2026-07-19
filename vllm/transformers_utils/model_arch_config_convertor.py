@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import final
+import dataclasses
+from collections.abc import Mapping
+from typing import Any, final
 
 import torch
 from safetensors.torch import _TYPES as _SAFETENSORS_TO_TORCH_DTYPE
@@ -20,6 +22,12 @@ from vllm.transformers_utils.config import (
 from vllm.utils.torch_utils import common_broadcastable_dtype
 
 logger = init_logger(__name__)
+
+
+def _get_block_config_value(block: object, name: str) -> Any:
+    if isinstance(block, Mapping):
+        return block.get(name)
+    return getattr(block, name, None)
 
 
 class ModelArchConfigConvertorBase:
@@ -133,16 +141,20 @@ class ModelArchConfigConvertorBase:
         """
         max_experts = 0
         block_configs = getattr(self.hf_text_config, "block_configs", None)
-        if block_configs:
-            for block in block_configs:
-                if isinstance(block, dict):
-                    if block.get("block_type", "") == "moe":
-                        max_experts = max(max_experts, block.get("n_routed_experts", 0))
-                else:
-                    if getattr(block, "block_type", "") == "moe":
-                        max_experts = max(
-                            max_experts, getattr(block, "n_routed_experts", 0)
-                        )
+        if not block_configs:
+            return 0
+
+        for block in block_configs:
+            if dataclasses.is_dataclass(block) and not isinstance(block, type):
+                block = dataclasses.asdict(block)
+
+            block_type = _get_block_config_value(block, "block_type")
+            if block_type not in (None, "moe"):
+                continue
+            for key in ("n_routed_experts", "num_local_experts", "num_experts"):
+                if num_experts := _get_block_config_value(block, key):
+                    max_experts = max(max_experts, num_experts)
+                    break
         return max_experts
 
     def get_num_experts(self) -> int:

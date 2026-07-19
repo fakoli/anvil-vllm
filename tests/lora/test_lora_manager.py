@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -45,6 +46,52 @@ DEVICES = (
 )
 
 DEFAULT_DTYPE = torch.get_default_dtype()
+
+
+@pytest.mark.parametrize(
+    "architecture", ["GptOssForCausalLM", "GptOssPuzzleForCausalLM"]
+)
+def test_mixed_moe_lora_conversion_uses_gpt_oss_interleaving(
+    architecture: str,
+) -> None:
+    manager = LoRAModelManager.__new__(LoRAModelManager)
+    manager.model = SimpleNamespace(
+        config=SimpleNamespace(architectures=[architecture])
+    )
+    gate_up = SimpleNamespace(
+        lora_a=torch.arange(2).reshape(2, 1),
+        lora_b=torch.arange(8).reshape(4, 2),
+    )
+    down = SimpleNamespace(
+        lora_a=torch.arange(2).reshape(2, 1),
+        lora_b=torch.arange(4).reshape(2, 2),
+    )
+    module_name = "model.layers.0.mlp.experts"
+    lora_model = SimpleNamespace(
+        loras={
+            f"{module_name}.base_layer": gate_up,
+            module_name: down,
+        }
+    )
+    manager._get_lora_layer_weights = lambda model, name: model.loras.get(name)
+    module = SimpleNamespace(local_num_experts=2, global_num_experts=2, ep_rank=0)
+
+    manager._convert_3d_to_2d_moe_lora(lora_model, module, module_name)
+
+    torch.testing.assert_close(down.lora_b[0].flatten(), torch.tensor([0, 4, 1, 5]))
+    torch.testing.assert_close(down.lora_b[2].flatten(), torch.tensor([2, 6, 3, 7]))
+
+
+def test_gpt_oss_puzzle_lora_with_ep_fails_closed() -> None:
+    manager = LoRAModelManager.__new__(LoRAModelManager)
+    manager.model = SimpleNamespace(
+        config=SimpleNamespace(architectures=["GptOssPuzzleForCausalLM"])
+    )
+    manager._use_ep = True
+    manager._is_moe = True
+
+    with pytest.raises(ValueError, match="per-layer expert placement"):
+        manager._validate_expert_parallel_support()
 
 
 @pytest.mark.parametrize("device", DEVICES)

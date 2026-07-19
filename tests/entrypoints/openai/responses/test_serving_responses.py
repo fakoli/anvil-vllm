@@ -51,6 +51,7 @@ from vllm.entrypoints.openai.responses.streaming_events import (
 )
 from vllm.inputs import tokens_input
 from vllm.outputs import CompletionOutput, RequestOutput
+from vllm.parser import HarmonyParser
 from vllm.parser.harmony import Segment
 from vllm.sampling_params import SamplingParams
 
@@ -94,6 +95,31 @@ def test_serialize_message_pydantic_model_returns_dict() -> None:
     assert isinstance(serialized, dict)
     assert serialized["type"] == "raw_message_tokens"
     assert serialized["message"] == "hello"
+
+
+def test_gpt_oss_puzzle_selects_harmony_responses_path() -> None:
+    engine_client = MagicMock()
+    model_config = MagicMock()
+    model_config.model = "nvidia/gpt-oss-puzzle-88B"
+    model_config.hf_config.model_type = "gpt_oss_puzzle"
+    model_config.generation_config = "auto"
+    model_config.get_diff_sampling_param.return_value = {}
+    engine_client.model_config = model_config
+
+    serving = OpenAIServingResponses(
+        engine_client=engine_client,
+        models=MagicMock(),
+        online_renderer=MagicMock(),
+        request_logger=None,
+        chat_template=None,
+        chat_template_content_format="auto",
+        reasoning_parser="openai_gptoss",
+        tool_parser="openai",
+        enable_auto_tools=True,
+    )
+
+    assert serving.use_harmony
+    assert serving.parser is HarmonyParser
 
 
 @pytest.fixture
